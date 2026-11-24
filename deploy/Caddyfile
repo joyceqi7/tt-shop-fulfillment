@@ -1,0 +1,163 @@
+# ===========================================
+# Caddy v2 反向代理配置 —— 生产
+# - 自动 Let's Encrypt HTTPS（80/443 必须能从公网到达）
+# - HTTP/2 + HTTP/3 默认开启
+# - 代理到 api 容器（compose 网络内的服务名）
+# ===========================================
+
+{
+    email {$ACME_EMAIL}
+
+    # 默认强制 HTTPS（80 自动跳 443）
+    # 不需要 admin API 暴露（默认 localhost only，OK 不动）
+
+    # 日志
+    log {
+        format json
+        level INFO
+    }
+}
+
+# ============== 主站点：tts-api.sailson.com ==============
+tts-api.sailson.com {
+
+    # ---- 安全 header ----
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        # 隐藏 server 暴露
+        -Server
+    }
+
+    # ---- /metrics 端点：仅内网/Prometheus 访问 ----
+    # 上线 Prometheus 后把白名单 IP 替换进来；现在留个口子
+    @metrics path /metrics
+    handle @metrics {
+        # 临时全 allow，等 Prometheus IP 确定后改
+        # 推荐做法（取消注释）：
+        #   @notallowed not remote_ip 10.0.0.0/8 192.168.0.0/16 <prometheus_ip>
+        #   abort @notallowed
+        reverse_proxy api:8000
+    }
+
+    # ---- /admin/* 端点：限制源 IP（可选）----
+    # 联调期可以全开（靠 X-Admin-Token 鉴权）；上线后建议加 IP 白名单
+    @admin path /admin/*
+    handle @admin {
+        # 推荐做法（取消注释 + 把 OFFICE_IP 替换成办公室出口 IP）：
+        #   @badip not remote_ip <OFFICE_IP>/32
+        #   abort @badip
+        reverse_proxy api:8000
+    }
+
+    # ---- /webhooks/tts：TT 推送，全开放 ----
+    # 真正的来源限制由 Cloudflare WAF 在更外层做（拿到 TT IP 段后配）
+    @webhook path /webhooks/*
+    handle @webhook {
+        reverse_proxy api:8000 {
+            # webhook 一定要快，超时收紧到 5s
+            transport http {
+                response_header_timeout 5s
+            }
+        }
+    }
+
+    # ---- 健康检查：公开（Cloudflare / 监控用）----
+    @health path /health/*
+    handle @health {
+        reverse_proxy api:8000
+    }
+
+    # ---- 兜底：其它路径默认代理到 api ----
+    handle {
+        reverse_proxy api:8000
+    }
+
+    # ---- 访问日志 ----
+    log {
+        output file /data/access.log {
+            roll_size 100mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+    }
+}
+
+# ============== 后台管理：tts-admin.sailson.com ==============
+# Next.js 14 standalone server 跑在 admin:3000；它自己内部把 /api/admin/* 转回 api:8000
+# cookie 设在 tts-admin.sailson.com 主机上，浏览器只会把它发到这个站
+tts-admin.sailson.com {
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    # 上传/导出大文件 → 给 4GB 上限, 防止默认 10MB 兜底打不出真实错误
+    request_body {
+        max_size 4GB
+    }
+
+    # ---- 内容创作：直接代理到 workflow-api，绕开 Next.js standalone 的 HTTP proxy ----
+    # 历史踩坑：把 /api/workflow/* 经过 Next.js rewrite 转发时，多文件 multipart 上传
+    # 偶尔会被 Node 端中转拦截 (内存缓冲 + 体积上限) → 浏览器看到 500 但没有任何 body。
+    # 这里让 Caddy 直接挑出来流式打到 workflow-api，admin 容器只负责渲染页面。
+    handle_path /api/workflow/* {
+        reverse_proxy workflow-api:8001 {
+            flush_interval -1
+            transport http {
+                read_timeout 1h
+                write_timeout 1h
+                dial_timeout 10s
+            }
+        }
+    }
+
+    # 素材/封面文件：/workflow-files/raw/xxx.mp4 → workflow-api:8001/files/raw/xxx.mp4
+    handle_path /workflow-files/* {
+        rewrite * /files{uri}
+        reverse_proxy workflow-api:8001 {
+            flush_interval -1
+            transport http {
+                read_timeout 1h
+                write_timeout 1h
+            }
+        }
+    }
+
+    # Next.js 自带的静态资源路径
+    @next path /_next/* /favicon.ico /assets/*
+    handle @next {
+        reverse_proxy admin:3000
+    }
+
+    # 兜底：所有页面 + /api/admin/* rewrite 都交给 admin 容器
+    handle {
+        reverse_proxy admin:3000
+    }
+
+    log {
+        output file /data/admin-access.log {
+            roll_size 100mb
+            roll_keep 5
+            roll_keep_for 720h
+        }
+        format json
+    }
+}
+
+# ============== 兜底：其它任何 host 一律 421 ==============
+# 防止有人直接用 IP 访问 / 用未知 host 访问拿到默认页
+# 用 http:// + https:// 显式区分，避免和上面 site block 的 80/443 冲突
+http:// {
+    abort
+}
+https:// {
+    abort
+}

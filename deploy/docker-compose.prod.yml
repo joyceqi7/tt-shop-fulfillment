@@ -1,0 +1,195 @@
+# ===========================================
+# TT Shop 履约系统 —— 生产 Compose（单 ECS 一站式）
+#
+# 5 个服务一台机器上跑：caddy / api / worker / postgres / redis
+# 适用 MVP 阶段（QPS < 100，单店上线）；后续 QPS 真打起来再拆 RDS / 云 Redis。
+#
+# 用法：
+#   cd /opt/tt-shop
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env.production up -d
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env.production logs -f api
+# ===========================================
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: tts-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tts}
+      POSTGRES_USER: ${POSTGRES_USER:-tts}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?must be set in .env.production}
+    volumes:
+      - /data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-tts}", "-d", "${POSTGRES_DB:-tts}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # 只暴露给容器网络，不开放到宿主机外网
+    expose:
+      - "5432"
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    container_name: tts-redis
+    restart: always
+    # AOF 持久化，appendfsync everysec 性能/安全平衡
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - /data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    expose:
+      - "6379"
+    networks:
+      - backend
+
+  api:
+    image: tt-shop:latest
+    container_name: tts-api
+    restart: always
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env.production
+    # 启动时先跑 migration 再起 uvicorn —— 容器内串行，避免多实例竞争
+    # 用 flow-array 单行字符串形式，避免 YAML 折叠（>）把换行保留进 sh -c 导致参数被截断
+    command:
+      - sh
+      - -c
+      - "alembic upgrade head && exec uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --workers 2 --proxy-headers --forwarded-allow-ips=*"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8000"
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  worker:
+    image: tt-shop:latest
+    container_name: tts-worker
+    restart: always
+    env_file:
+      - ../.env.production
+    command: ["arq", "app.workers.settings.WorkerSettings"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # 等 api 跑完 migration 再起 worker，避免 worker 见到旧 schema
+      api:
+        condition: service_healthy
+    networks:
+      - backend
+    healthcheck:
+      # arq 自身不暴露 HTTP；slim 镜像没装 procps (pgrep 不在)，直接读 /proc/1/cmdline
+      # tini 是 PID 1，其 cmdline 会带着子命令参数（含 "arq app.workers"）
+      test: ["CMD-SHELL", "grep -q 'app.workers' /proc/1/cmdline"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+  admin:
+    image: tt-shop-admin:latest
+    container_name: tts-admin
+    restart: always
+    build:
+      context: ../admin
+      dockerfile: Dockerfile
+    environment:
+      # Next.js server 端 rewrite 用，把浏览器侧的 /api/admin/* 转回 api 容器
+      API_BASE_URL: http://api:8000
+      # 内容创作模块：Next rewrite 把 /api/workflow/* 转到该服务
+      WORKFLOW_API_BASE_URL: http://workflow-api:8001
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    depends_on:
+      api:
+        condition: service_healthy
+      workflow-api:
+        condition: service_healthy
+    expose:
+      - "3000"
+    networks:
+      - backend
+    # 用 node 自带 fetch 做健康检查（slim 镜像没装 wget/curl）
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  workflow-api:
+    image: tt-shop-workflow:latest
+    container_name: tts-workflow-api
+    restart: always
+    build:
+      context: ../video-workflow
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env.production
+    environment:
+      DATABASE_URL: sqlite:////data/workflow/workflow.db
+      STORAGE_ROOT: /data/workflow
+      BGM_DIR: /data/workflow/bgm
+      MAX_CONCURRENT_JOBS: ${WORKFLOW_MAX_CONCURRENT_JOBS:-1}
+    volumes:
+      - /data/workflow:/data/workflow
+    expose:
+      - "8001"
+    networks:
+      - backend
+    healthcheck:
+      # /healthz 只回 {"ok":true}, 不走库不走 storage, 即便磁盘满也能起来
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: tts-caddy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /data/caddy/data:/data
+      - /data/caddy/config:/config
+    environment:
+      # Caddy 用这个邮箱跟 Let's Encrypt 注册
+      ACME_EMAIL: ${ACME_EMAIL:?must be set in .env.production}
+    depends_on:
+      api:
+        condition: service_healthy
+      admin:
+        condition: service_started
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge

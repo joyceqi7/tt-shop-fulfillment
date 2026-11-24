@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+# admin frontend 的 lib 是源码目录，必须保留（gitignore 默认规则会全项目匹配 lib/）
+!admin/lib/
+!admin/lib/**
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+env/
+
+# Env / Secrets
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+.env.prod
+!.env.example
+!deploy/env.production.example
+*.pem
+*.key
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+
+# DB / migrations local artefacts
+*.sqlite3
+*.db
+video-workflow/backend/storage/
+
+# Docker
+.docker/
+
+# Cards / sensitive artifacts
+cards/
+*.csv
+!tests/fixtures/*.csv
