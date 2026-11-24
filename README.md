@@ -10,7 +10,7 @@ TikTok Shop 美区虚拟类目自动发码履约系统。
 
 ## 当前进度
 
-- [x] Week 0：签名算法 `signer.py` + 21 条单测（含 2 条 live golden）
+- [x] Week 0：签名算法 `signer.py` + 单测；公开版去掉了 2 条使用真实测试凭据的 live golden 用例
 - [x] Week 0：PoC 脚本跑通 `refresh_token` / `get_authorized_shops` / `getOrderList`
 - [x] Week 1：项目脚手架（Pydantic Settings、Alembic、Async SQLAlchemy）
 - [x] Week 1：`TokenManager`（Redis 分布式锁防并发刷新 + Fernet 加密落库）
